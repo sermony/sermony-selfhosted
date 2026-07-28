@@ -1,0 +1,240 @@
+#!/usr/bin/env bash
+#
+# Sermony.Recorder — interaktives Setup für Production-Deployments (Raspberry Pi / Linux).
+#
+# Erzeugt die .env mit Secrets + Operator-Werten neben der docker-compose.yml
+# (Release-Bundle: flach im Installationsordner; Git-Clone: unter deploy/).
+#
+# Idempotent + sicher: ein Re-Run BEWAHRT bestehende Werte (v.a. API_KEY und
+# RECORDER_TOKEN). Vorhandene Werte werden gelesen und mit Enter behalten; nur
+# fehlende Secrets werden frisch erzeugt. Wer alles neu will, löscht die .env.
+#
+# Muster analog Sermony.Web scripts/setup.sh.
+
+# Unter sh/dash gestartet (z.B. `sh setup.sh`)? → mit bash re-execen; das Skript
+# nutzt Bash-Features (pipefail, [[ ]], printf -v) und bricht unter dash sonst
+# mit "set: Illegal option -o pipefail".
+if [ -z "${BASH_VERSION:-}" ]; then
+  command -v bash >/dev/null 2>&1 || { echo "FEHLER: bash wird benötigt." >&2; exit 1; }
+  exec bash "$0" "$@"
+fi
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Zwei Layouts, automatisch erkannt:
+#   • Git-Clone:       <repo>/scripts/setup.sh + <repo>/deploy/   (Maintainer)
+#   • Release-Bundle:  alles flach neben setup.sh, z.B. /opt/sermony-recorder/  (Kunde)
+if [[ -d "$SCRIPT_DIR/../deploy" ]]; then
+  DEPLOY_DIR="$(cd "$SCRIPT_DIR/../deploy" && pwd)"
+else
+  DEPLOY_DIR="$SCRIPT_DIR"
+fi
+ENV_FILE="$DEPLOY_DIR/.env"
+
+c_green()  { printf '\033[32m%s\033[0m\n' "$*"; }
+c_yellow() { printf '\033[33m%s\033[0m\n' "$*"; }
+c_red()    { printf '\033[31m%s\033[0m\n' "$*" >&2; }
+
+# Liest den Wert eines Keys aus einer .env (erste Fundstelle); Quotes + CRLF entfernt.
+read_env_value() {
+  local key="$1" file="$2" line val
+  [[ -f "$file" ]] || return 0
+  line="$(grep -E "^${key}=" "$file" | head -n1 || true)"
+  [[ -n "$line" ]] || return 0
+  val="${line#*=}"
+  val="${val%$'\r'}"
+  val="${val#\"}"; val="${val%\"}"
+  val="${val#\'}"; val="${val%\'}"
+  printf '%s' "$val"
+}
+
+# Prompt mit Default: prompt_value VAR "Frage" "default" [required]
+prompt_value() {
+  local __var="$1" question="$2" default="$3" required="${4:-}" input
+  while true; do
+    if [[ -n "$default" ]]; then
+      read -r -p "$question [$default]: " input
+      input="${input:-$default}"
+    else
+      read -r -p "$question: " input
+    fi
+    if [[ -z "$input" && "$required" == "required" ]]; then
+      c_yellow "  Pflichtfeld — bitte einen Wert eingeben."
+      continue
+    fi
+    break
+  done
+  printf -v "$__var" '%s' "$input"
+}
+
+command -v openssl >/dev/null 2>&1 || { c_red "openssl wird benötigt (API-Key-Generierung)."; exit 1; }
+if ! command -v docker >/dev/null 2>&1; then
+  c_red "Docker wird benötigt, ist aber nicht installiert."
+  c_yellow "Debian/Raspberry Pi OS schnell:  curl -fsSL https://get.docker.com | sh"
+  exit 1
+fi
+
+echo
+c_green "── Sermony.Recorder Setup ─────────────────────────────────────────────"
+if [[ -f "$ENV_FILE" ]]; then
+  c_yellow ".env existiert — bestehende Werte werden vorgeschlagen/bewahrt."
+fi
+echo
+
+# ── Bestehende Werte lesen ────────────────────────────────────────────────────
+CUR_SERMONY_HOST="$(read_env_value SERMONY_HOST "$ENV_FILE")"
+CUR_RECORDER_ID="$(read_env_value RECORDER_ID "$ENV_FILE")"
+CUR_RECORDER_TOKEN="$(read_env_value RECORDER_TOKEN "$ENV_FILE")"
+CUR_API_KEY="$(read_env_value API_KEY "$ENV_FILE")"
+CUR_TZ="$(read_env_value TZ "$ENV_FILE")"
+CUR_PROFILES="$(read_env_value COMPOSE_PROFILES "$ENV_FILE")"
+CUR_AUDIO_CHANNELS="$(read_env_value AUDIO_CHANNELS "$ENV_FILE")"
+CUR_IMAGE="$(read_env_value RECORDER_IMAGE "$ENV_FILE")"
+CUR_UPLOAD_URL="$(read_env_value UPLOAD_URL "$ENV_FILE")"
+CUR_W_HOST="$(read_env_value W_HOST "$ENV_FILE")"
+CUR_W_USERNAME="$(read_env_value W_USERNAME "$ENV_FILE")"
+CUR_W_PASSWORD="$(read_env_value W_PASSWORD "$ENV_FILE")"
+CUR_W_PATH="$(read_env_value W_PATH "$ENV_FILE")"
+CUR_META_ORGANIZATION="$(read_env_value META_ORGANIZATION "$ENV_FILE")"
+CUR_META_WEBSITE="$(read_env_value META_WEBSITE "$ENV_FILE")"
+CUR_META_LANGUAGE="$(read_env_value META_LANGUAGE "$ENV_FILE")"
+CUR_TITLE_PREFIX="$(read_env_value TITLE_PREFIX "$ENV_FILE")"
+CUR_SCREEN_UPDATE_CHANNEL="$(read_env_value SCREEN_UPDATE_CHANNEL "$ENV_FILE")"
+CUR_SCREEN_UPDATE_URL="$(read_env_value SCREEN_UPDATE_URL "$ENV_FILE")"
+CUR_SCREEN_PICKUP_DIR="$(read_env_value SCREEN_PICKUP_DIR "$ENV_FILE")"
+
+# ── Sermony-Anbindung ─────────────────────────────────────────────────────────
+c_green "Sermony-Anbindung (Werte aus der Webapp: Einstellungen → Recorder)"
+prompt_value SERMONY_HOST "Sermony-URL (https://…)" "$CUR_SERMONY_HOST" required
+prompt_value RECORDER_ID "Recorder-ID" "$CUR_RECORDER_ID" required
+prompt_value RECORDER_TOKEN "Recorder-Token" "$CUR_RECORDER_TOKEN" required
+echo
+
+# ── Allgemein ─────────────────────────────────────────────────────────────────
+prompt_value TZ "Zeitzone (Aufnahme-Scheduler!)" "${CUR_TZ:-Europe/Berlin}"
+prompt_value AUDIO_CHANNELS "Audio-Kanäle (1=Mono, 2=Stereo)" "${CUR_AUDIO_CHANNELS:-1}"
+
+# ── ESP32-Display ─────────────────────────────────────────────────────────────
+DEFAULT_ESP32="n"; [[ "$CUR_PROFILES" == *esp32* ]] && DEFAULT_ESP32="j"
+read -r -p "ESP32-Display angeschlossen? (j/n) [$DEFAULT_ESP32]: " ESP32_ANSWER
+ESP32_ANSWER="${ESP32_ANSWER:-$DEFAULT_ESP32}"
+COMPOSE_PROFILES=""
+[[ "$ESP32_ANSWER" =~ ^[jJyY] ]] && COMPOSE_PROFILES="esp32"
+echo
+
+# ── Upload-Ziel ───────────────────────────────────────────────────────────────
+DEFAULT_UPLOAD="1"
+[[ -n "$CUR_W_HOST" ]] && DEFAULT_UPLOAD="2"
+[[ -n "$CUR_UPLOAD_URL" ]] && DEFAULT_UPLOAD="3"
+c_green "Upload-Ziel für fertige Aufnahmen"
+echo "  1) keins (nur lokal auf dem Gerät)"
+echo "  2) WebDAV (z.B. Nextcloud)"
+echo "  3) HTTP-Endpoint"
+read -r -p "Auswahl [$DEFAULT_UPLOAD]: " UPLOAD_CHOICE
+UPLOAD_CHOICE="${UPLOAD_CHOICE:-$DEFAULT_UPLOAD}"
+UPLOAD_URL=""; W_HOST=""; W_USERNAME=""; W_PASSWORD=""; W_PATH="/"
+case "$UPLOAD_CHOICE" in
+  2)
+    prompt_value W_HOST "WebDAV-Host (https://…)" "$CUR_W_HOST" required
+    prompt_value W_USERNAME "WebDAV-Benutzer" "$CUR_W_USERNAME" required
+    prompt_value W_PASSWORD "WebDAV-Passwort" "$CUR_W_PASSWORD" required
+    prompt_value W_PATH "WebDAV-Zielpfad" "${CUR_W_PATH:-/}"
+    ;;
+  3)
+    prompt_value UPLOAD_URL "Upload-URL (https://…)" "$CUR_UPLOAD_URL" required
+    ;;
+esac
+echo
+
+# ── Metadaten (optional) ──────────────────────────────────────────────────────
+prompt_value META_ORGANIZATION "Gemeinde-/Organisationsname für ID3-Tags (leer = keiner)" "$CUR_META_ORGANIZATION"
+prompt_value META_WEBSITE "Webseite für ID3-Tags (leer = keine)" "$CUR_META_WEBSITE"
+echo
+
+# ── Secrets generieren (nur fehlende) ─────────────────────────────────────────
+API_KEY="$CUR_API_KEY"
+if [[ -z "$API_KEY" ]]; then
+  API_KEY="$(openssl rand -hex 32)"
+  c_green "API_KEY neu generiert."
+else
+  c_yellow "Bestehender API_KEY wird bewahrt."
+fi
+
+# ── .env schreiben ────────────────────────────────────────────────────────────
+mkdir -p "$DEPLOY_DIR"
+umask 077
+cat > "$ENV_FILE" <<EOF
+# Sermony.Recorder — generiert von setup.sh am $(date -Iseconds)
+# Re-Run von setup.sh bewahrt Werte; upgrade.sh trägt neue Keys nach.
+
+# Sermony-Anbindung
+SERMONY_HOST=$SERMONY_HOST
+RECORDER_ID=$RECORDER_ID
+RECORDER_TOKEN=$RECORDER_TOKEN
+
+# Sicherheit
+API_KEY=$API_KEY
+
+# Allgemein
+TZ=$TZ
+DEBUG=false
+AUDIO_CHANNELS=$AUDIO_CHANNELS
+RECORDER_IMAGE=${CUR_IMAGE:-ghcr.io/sermony/recorder:stable}
+
+# Optionale Bausteine
+COMPOSE_PROFILES=$COMPOSE_PROFILES
+
+# Display-Firmware-Updates (nur mit esp32-Profil relevant)
+SCREEN_UPDATE_CHANNEL=${CUR_SCREEN_UPDATE_CHANNEL:-stable}
+SCREEN_UPDATE_URL=${CUR_SCREEN_UPDATE_URL:-}
+SCREEN_PICKUP_DIR=${CUR_SCREEN_PICKUP_DIR:-/opt/sermony-recorder/screen-pickup}
+
+# Upload-Ziel
+UPLOAD_URL=$UPLOAD_URL
+W_HOST=$W_HOST
+W_USERNAME=$W_USERNAME
+W_PASSWORD=$W_PASSWORD
+W_PATH=$W_PATH
+
+# ID3-Metadaten
+META_ORGANIZATION=$META_ORGANIZATION
+META_LANGUAGE=${CUR_META_LANGUAGE:-German}
+META_WEBSITE=$META_WEBSITE
+META_ARTIST=
+META_ALBUM=
+META_COMPOSER=
+TITLE_PREFIX=${CUR_TITLE_PREFIX:-}
+EOF
+chmod 600 "$ENV_FILE"
+c_green "$ENV_FILE geschrieben (chmod 600)."
+echo
+
+# ── Pickup-Ordner für Display-Firmware-Updates ────────────────────────────────
+# Muss VOR dem Compose-Start existieren und dem Container-User (uid 1000)
+# gehören — sonst legt Docker ihn root-owned an und screen_host kann die
+# done/failed-Unterordner nicht anlegen.
+if [[ "$COMPOSE_PROFILES" == *esp32* ]]; then
+  PICKUP_DIR="${CUR_SCREEN_PICKUP_DIR:-/opt/sermony-recorder/screen-pickup}"
+  if install -d -o 1000 -g 1000 "$PICKUP_DIR" 2>/dev/null; then
+    c_green "Pickup-Ordner für Display-Updates: $PICKUP_DIR"
+  else
+    c_yellow "Pickup-Ordner $PICKUP_DIR konnte nicht angelegt werden (sudo nötig?):"
+    c_yellow "  sudo install -d -o 1000 -g 1000 $PICKUP_DIR"
+  fi
+  echo
+fi
+
+# ── Start anbieten ────────────────────────────────────────────────────────────
+read -r -p "Stack jetzt starten? (j/n) [j]: " START_ANSWER
+START_ANSWER="${START_ANSWER:-j}"
+if [[ "$START_ANSWER" =~ ^[jJyY] ]]; then
+  cd "$DEPLOY_DIR"
+  docker compose pull
+  docker compose up -d
+  echo
+  c_green "Gestartet. Status:  cd $DEPLOY_DIR && docker compose ps"
+  c_green "Bedien-UI:          http://<host>:5000"
+else
+  c_yellow "Später starten mit:  cd $DEPLOY_DIR && docker compose up -d"
+fi

@@ -1,0 +1,279 @@
+# Sermony.Recorder — Production-Deploy (Raspberry Pi / Linux-Host).
+#
+# Bedienung:
+#   1. ./scripts/setup.sh            → erzeugt deploy/.env (Secrets, Gerätewahl, Upload-Ziel)
+#   2. cd deploy && docker compose up -d
+#   3. Updates später: ./scripts/upgrade.sh
+#
+# Design-Entscheidungen:
+#   - KEIN privileged: Devices via /dev-Bind + device_cgroup_rules (USB-Hotplug
+#     funktioniert, Zugriff bleibt auf ALSA/V4L2/Serial beschränkt) + group_add
+#     (das Image läuft als Non-Root-User `sermony`, uid 1000 — ohne die Gruppen
+#     scheitert jedes Geräte-Öffnen mit EACCES, obwohl die Liste via /proc klappt).
+#   - Nur Port 5000 (Bedien-UI/API) geht ans LAN; alle anderen Services sind intern.
+#   - Log-Rotation überall (json-file wächst sonst unbegrenzt → volle SD-Karte).
+#   - ESP32-Display ist optional: Profil "esp32" (setup.sh setzt COMPOSE_PROFILES).
+#
+# Die Root-docker-compose.yml des Repos ist gitignored und NUR für lokale
+# Entwicklung — Deployments nutzen DIESE Datei.
+
+name: sermony-recorder
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+x-common-env: &common-env
+  TZ: "${TZ:-Europe/Berlin}"
+  SERMONY_HOST: "${SERMONY_HOST:?SERMONY_HOST must be set — ./scripts/setup.sh ausführen}"
+  RECORDER_ID: "${RECORDER_ID:?RECORDER_ID must be set — ./scripts/setup.sh ausführen}"
+  RECORDER_TOKEN: "${RECORDER_TOKEN:?RECORDER_TOKEN must be set — ./scripts/setup.sh ausführen}"
+
+services:
+  # ── Zentrale API + Bedien-UI + Sermony-WS-Anbindung ─────────────────────────
+  server:
+    container_name: server
+    image: ${RECORDER_IMAGE:-ghcr.io/sermony/recorder:stable}
+    restart: unless-stopped
+    command: ["gunicorn", "--chdir", "/app", "-b", "0.0.0.0:5000", "-k", "gevent", "-w", "1", "services.server.server:app"]
+    ports:
+      - "5000:5000"
+    volumes:
+      - audio:/mnt/audio
+      - log:/tmp
+    environment:
+      <<: *common-env
+      AUDIO_RECORDER_URL: "http://media_capture_streaming:5001"
+      SCREEN_HOST_URL: "http://screen_host:5003"
+      NETWORK_AGENT_URL: "http://network_agent:5004"
+      DEBUG: "${DEBUG:-false}"
+      # PFLICHT (Audit M5/SRV-1): ohne API_KEY werden externe Clients zwar mit
+      # 401 abgelehnt, aber die IP-Allowlist bleibt der einzige Schutz — auf
+      # geteiltem LAN zu wenig. setup.sh generiert den Key automatisch.
+      API_KEY: "${API_KEY:?API_KEY must be set — ./scripts/setup.sh ausführen}"
+      OUTPUT_DIR: "/mnt/audio"
+    depends_on:
+      media_capture_streaming:
+        condition: service_healthy
+    networks:
+      - intern_bridge
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000/api/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: "1.0"
+        reservations:
+          memory: 128M
+
+  # ── Aufnahme + Streaming (FFmpeg) ────────────────────────────────────────────
+  media_capture_streaming:
+    container_name: media_capture_streaming
+    image: ${RECORDER_IMAGE:-ghcr.io/sermony/recorder:stable}
+    restart: unless-stopped
+    command: ["python", "-m", "services.media_capture_streaming.mcs_main"]
+    # Graceful Shutdown: mcs flusht/merged bei SIGTERM die laufende Aufnahme und
+    # beendet den Stream sauber. Docker-Default (10s) würde den Merge per SIGKILL
+    # abschneiden → mehr Zeit geben.
+    stop_grace_period: 30s
+    cap_add:
+      - SYS_NICE        # FFmpeg priorisiert seine Threads
+    # Geräte-Zugriff OHNE privileged, hotplug-fähig:
+    #   /dev-Bind macht (auch neu eingesteckte) Nodes sichtbar,
+    #   device_cgroup_rules beschränkt den ZUGRIFF auf Audio + Video,
+    #   group_add gibt dem Non-Root-User die nötigen Datei-Rechte
+    #   (Debian-Container: audio=29, video=44 — identisch zu Raspberry Pi OS;
+    #    bei abweichenden Host-GIDs numerisch eintragen).
+    volumes:
+      - /dev:/dev
+      - audio:/mnt/audio
+      - log:/tmp
+    device_cgroup_rules:
+      - 'c 116:* rmw'   # ALSA   (/dev/snd/*)
+      - 'c 81:* rmw'    # V4L2   (/dev/video*)
+    group_add:
+      - "audio"
+      - "video"
+    environment:
+      <<: *common-env
+      PORT: "5001"
+      FFMPEG_LOGLEVEL: "info"
+      RECORDER_SERVER_URL: "http://server:5000"
+      SCREEN_HOST_URL: "http://screen_host:5003"
+      JWT_OUTBOUND_ISSUER: "SermonyRecorderServer"
+      JWT_OUTBOUND_AUDIENCE: "Sermony"
+      OUTPUT_DIR: "/mnt/audio"
+      AUDIO_CHANNELS: "${AUDIO_CHANNELS:-1}"
+    networks:
+      - intern_bridge
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5001/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: "4.0"
+        reservations:
+          memory: 512M
+
+  # ── ESP32-Display-Anbindung (optional, Profil "esp32") ──────────────────────
+  screen_host:
+    container_name: screen_host
+    image: ${RECORDER_IMAGE:-ghcr.io/sermony/recorder:stable}
+    restart: unless-stopped
+    profiles: ["esp32"]
+    command: ["python", "-m", "services.screen_host.screen_host"]
+    expose:
+      - "5003"
+    environment:
+      <<: *common-env
+      SERVER_URL: "http://server:5000"
+      SCREEN_HOST_BIND: "0.0.0.0"
+      SCREEN_HOST_PORT: "5003"
+      # Display-Firmware-Updates (siehe deploy/.env.example)
+      SCREEN_UPDATE_CHANNEL: ${SCREEN_UPDATE_CHANNEL:-stable}
+      SCREEN_UPDATE_URL: ${SCREEN_UPDATE_URL:-}
+      SCREEN_UPDATE_DATA_DIR: /data/screen_updates
+      SCREEN_PICKUP_DIR: /data/screen_pickup
+    # Serial hotplug-fähig: /dev-Bind + udev (pyserial liest Beschreibung/VID:PID)
+    # + cgroup-Regeln nur für die Serial-Major-Numbers.
+    volumes:
+      - /dev:/dev
+      - /run/udev:/run/udev:ro
+      # Persistente Downloads/State für Firmware-Updates + Pickup-Ordner auf dem Host
+      - screen_updates:/data/screen_updates
+      - ${SCREEN_PICKUP_DIR:-/opt/sermony-recorder/screen-pickup}:/data/screen_pickup
+    device_cgroup_rules:
+      - 'c 166:* rmw'   # ttyACM* (ESP32-S3 USB-JTAG, CDC-ACM)
+      - 'c 188:* rmw'   # ttyUSB* (CP210x, CH340, FTDI)
+    group_add:
+      - "dialout"       # Datei-Rechte auf /dev/tty* (Debian GID 20)
+    depends_on:
+      server:
+        condition: service_healthy
+    networks:
+      - intern_bridge
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5003/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: "0.5"
+        reservations:
+          memory: 64M
+
+  # ── Konvertierung (96k CBR) + Upload (WebDAV/HTTP) ──────────────────────────
+  converter_upload:
+    container_name: converter_upload
+    image: ${RECORDER_IMAGE:-ghcr.io/sermony/recorder:stable}
+    restart: unless-stopped
+    command: ["python", "-m", "services.converter_upload.converter_upload"]
+    expose:
+      - "5002"
+    depends_on:
+      server:
+        condition: service_healthy
+    environment:
+      <<: *common-env
+      # Upload-Ziel: ENTWEDER UPLOAD_URL (HTTP) ODER W_* (WebDAV); beides leer ⇒ nur lokal
+      UPLOAD_URL: "${UPLOAD_URL:-}"
+      W_HOST: "${W_HOST:-}"
+      W_USERNAME: "${W_USERNAME:-}"
+      W_PASSWORD: "${W_PASSWORD:-}"
+      W_PATH: "${W_PATH:-/}"
+      # ID3-Metadaten (optional)
+      META_ORGANIZATION: "${META_ORGANIZATION:-}"
+      META_LANGUAGE: "${META_LANGUAGE:-German}"
+      META_WEBSITE: "${META_WEBSITE:-}"
+      META_ARTIST: "${META_ARTIST:-}"
+      META_ALBUM: "${META_ALBUM:-}"
+      META_COMPOSER: "${META_COMPOSER:-}"
+      TITLE_PREFIX: "${TITLE_PREFIX:-}"
+      OUTPUT_DIR: "/mnt/audio"
+    volumes:
+      - audio:/mnt/audio
+    networks:
+      - intern_bridge
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5002/health', timeout=3)"]
+      interval: 60s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: "1.0"
+        reservations:
+          memory: 128M
+
+  # ── WLAN-Steuerung (nmcli via Host-D-Bus) ───────────────────────────────────
+  network_agent:
+    container_name: network_agent
+    image: ${RECORDER_IMAGE:-ghcr.io/sermony/recorder:stable}
+    restart: unless-stopped
+    command: ["gunicorn", "--chdir", "/app",
+              "-b", "0.0.0.0:5004",
+              "-k", "gthread", "-w", "1", "--threads", "1",
+              "--access-logfile", "-",
+              "services.network_agent.network_agent:app"]
+    # WLAN-Steuerung: nmcli redet via System-D-Bus mit dem Host-NetworkManager.
+    # user 0 nötig (PolicyKit akzeptiert Wifi-Connect nur für root); alle
+    # Endpunkte außer /health sind seit v0.1.3 mit X-Internal-Auth
+    # (= RECORDER_TOKEN aus common-env) gegated.
+    user: "0"
+    cap_add:
+      - NET_ADMIN
+    expose:
+      - "5004"
+    volumes:
+      - /var/run/dbus:/var/run/dbus:rw
+    environment:
+      <<: *common-env
+      NETWORK_AGENT_BIND: "0.0.0.0"
+      NETWORK_AGENT_PORT: "5004"
+    networks:
+      - intern_bridge
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5004/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+          cpus: "0.25"
+        reservations:
+          memory: 32M
+
+volumes:
+  audio:
+  log:
+  screen_updates:
+
+networks:
+  intern_bridge:
