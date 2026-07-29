@@ -32,6 +32,10 @@ else
 fi
 ENV_FILE="$DEPLOY_DIR/.env"
 
+# Gehostete Sermony-Instanz — Default fuer alle, die nicht selbst hosten.
+# Gegenstueck zu runtimeConfig.public.officialServerUrl in der Webapp.
+OFFICIAL_SERMONY_URL="https://app.sermony.de"
+
 c_green()  { printf '\033[32m%s\033[0m\n' "$*"; }
 c_yellow() { printf '\033[33m%s\033[0m\n' "$*"; }
 c_red()    { printf '\033[31m%s\033[0m\n' "$*" >&2; }
@@ -59,13 +63,26 @@ prompt_value() {
     else
       read -r -p "$question: " input
     fi
-    if [[ -z "$input" && "$required" == "required" ]]; then
+    # Auch reine Leerzeichen zaehlen als leer: sonst passiert ein " " die
+    # Pflichtpruefung, wird beim Normalisieren zu "" und die .env ist still kaputt.
+    if [[ -z "${input//[[:space:]]/}" && "$required" == "required" ]]; then
       c_yellow "  Pflichtfeld — bitte einen Wert eingeben."
       continue
     fi
     break
   done
   printf -v "$__var" '%s' "$input"
+}
+
+# Normalisiert eine getippte Adresse: Leerzeichen raus, fehlendes Schema auf
+# https:// ergaenzen, trailing Slash abschneiden. Laien tippen "app.sermony.de"
+# oder "https://app.sermony.de/" — beides landete bisher unveraendert in der .env
+# und ergab beim Ableiten des Upload-Pfades eine kaputte URL.
+normalize_url() {
+  local u="${1// /}"
+  [[ -n "$u" ]] || return 0
+  [[ "$u" =~ ^https?:// ]] || u="https://$u"
+  printf '%s' "${u%/}"
 }
 
 command -v openssl >/dev/null 2>&1 || { c_red "openssl wird benötigt (API-Key-Generierung)."; exit 1; }
@@ -91,6 +108,10 @@ CUR_TZ="$(read_env_value TZ "$ENV_FILE")"
 CUR_PROFILES="$(read_env_value COMPOSE_PROFILES "$ENV_FILE")"
 CUR_AUDIO_CHANNELS="$(read_env_value AUDIO_CHANNELS "$ENV_FILE")"
 CUR_IMAGE="$(read_env_value RECORDER_IMAGE "$ENV_FILE")"
+CUR_SERMONY_UPLOAD="$(read_env_value SERMONY_UPLOAD "$ENV_FILE")"
+# Legacy (vor ADR-029): eine gesetzte UPLOAD_URL bedeutete „Upload nach Sermony an".
+# Wird nur noch gelesen, um beim ersten Re-Run nach dem Upgrade die richtige
+# Vorauswahl zu treffen — geschrieben wird der Wert nicht mehr.
 CUR_UPLOAD_URL="$(read_env_value UPLOAD_URL "$ENV_FILE")"
 CUR_W_HOST="$(read_env_value W_HOST "$ENV_FILE")"
 CUR_W_USERNAME="$(read_env_value W_USERNAME "$ENV_FILE")"
@@ -105,51 +126,91 @@ CUR_SCREEN_UPDATE_URL="$(read_env_value SCREEN_UPDATE_URL "$ENV_FILE")"
 CUR_SCREEN_PICKUP_DIR="$(read_env_value SCREEN_PICKUP_DIR "$ENV_FILE")"
 
 # ── Sermony-Anbindung ─────────────────────────────────────────────────────────
-c_green "Sermony-Anbindung (Werte aus der Webapp: Einstellungen → Recorder)"
-prompt_value SERMONY_HOST "Sermony-URL (https://…)" "$CUR_SERMONY_HOST" required
-prompt_value RECORDER_ID "Recorder-ID" "$CUR_RECORDER_ID" required
-prompt_value RECORDER_TOKEN "Recorder-Token" "$CUR_RECORDER_TOKEN" required
+c_green "1/5 · Verbindung zu Sermony"
+echo "Der Recorder meldet sich bei deiner Sermony-Instanz an und lädt die fertigen"
+echo "Aufnahmen dorthin hoch. ID und Token bekommst du in der Webapp unter"
+echo "Einstellungen → Recorder → Token. Der Token wird dort nur EINMAL angezeigt."
+echo
+echo "Adresse deiner Instanz: Wenn du Sermony selbst betreibst, trage deine eigene"
+echo "Domain ein. Nutzt du das gehostete Sermony, drücke einfach Enter."
+prompt_value SERMONY_HOST "Sermony-Adresse" "${CUR_SERMONY_HOST:-$OFFICIAL_SERMONY_URL}" required
+SERMONY_HOST="$(normalize_url "$SERMONY_HOST")"
+prompt_value RECORDER_ID "Recorder-ID (aus der Webapp)" "$CUR_RECORDER_ID" required
+prompt_value RECORDER_TOKEN "Recorder-Token (aus der Webapp)" "$CUR_RECORDER_TOKEN" required
 echo
 
 # ── Allgemein ─────────────────────────────────────────────────────────────────
-prompt_value TZ "Zeitzone (Aufnahme-Scheduler!)" "${CUR_TZ:-Europe/Berlin}"
-prompt_value AUDIO_CHANNELS "Audio-Kanäle (1=Mono, 2=Stereo)" "${CUR_AUDIO_CHANNELS:-1}"
+c_green "2/5 · Aufnahme-Grundeinstellungen"
+echo "Die Zeitzone steuert, wann geplante Aufnahmen starten — steht hier die"
+echo "falsche Zone, nimmt das Gerät zur falschen Uhrzeit auf."
+prompt_value TZ "Zeitzone" "${CUR_TZ:-Europe/Berlin}"
+echo
+echo "Mono genügt für Predigten und halbiert die Dateigröße. Stereo nur, wenn ihr"
+echo "bewusst zweikanalig abnehmt (z.B. Musik über ein Mischpult)."
+prompt_value AUDIO_CHANNELS "Audio-Kanäle (1 = Mono, 2 = Stereo)" "${CUR_AUDIO_CHANNELS:-1}"
+echo
 
 # ── ESP32-Display ─────────────────────────────────────────────────────────────
+c_green "3/5 · Status-Display (optional)"
+echo "Gemeint ist das kleine per USB angeschlossene Display, das den Aufnahme-"
+echo "Status anzeigt und Start/Stopp erlaubt. Ohne so ein Gerät: n."
 DEFAULT_ESP32="n"; [[ "$CUR_PROFILES" == *esp32* ]] && DEFAULT_ESP32="j"
-read -r -p "ESP32-Display angeschlossen? (j/n) [$DEFAULT_ESP32]: " ESP32_ANSWER
+read -r -p "Display angeschlossen? (j/n) [$DEFAULT_ESP32]: " ESP32_ANSWER
 ESP32_ANSWER="${ESP32_ANSWER:-$DEFAULT_ESP32}"
 COMPOSE_PROFILES=""
 [[ "$ESP32_ANSWER" =~ ^[jJyY] ]] && COMPOSE_PROFILES="esp32"
 echo
 
 # ── Upload-Ziel ───────────────────────────────────────────────────────────────
-DEFAULT_UPLOAD="1"
-[[ -n "$CUR_W_HOST" ]] && DEFAULT_UPLOAD="2"
-[[ -n "$CUR_UPLOAD_URL" ]] && DEFAULT_UPLOAD="3"
-c_green "Upload-Ziel für fertige Aufnahmen"
-echo "  1) keins (nur lokal auf dem Gerät)"
-echo "  2) WebDAV (z.B. Nextcloud)"
-echo "  3) HTTP-Endpoint"
+# Seit ADR-029 (resumierbarer Upload) gibt es KEINE UPLOAD_URL mehr: der Recorder
+# fragt die Sermony-Instanz nach einer Upload-Sitzung und bekommt das Ziel samt
+# kurzlebigem Token zugewiesen. SERMONY_HOST ist damit die einzige Angabe.
+#
+# Die frühere Option „eigener HTTP-Endpoint" ist deshalb ENTFALLEN — das Protokoll
+# (Sitzung anlegen, tus, Registrierung abwarten) ist Sermony-spezifisch, eine
+# beliebige Gegenstelle kann es nicht bedienen. Wer nur Dateien ablegen will, nimmt
+# WebDAV. Bestehende .env-Dateien mit UPLOAD_URL werden beim Re-Run bereinigt.
+
+# Default: was bisher konfiguriert war. Bei einer bestehenden .env ganz ohne
+# Upload-Ziel bleibt es bei "keins" (sonst würde ein Enter-Durchklicken beim
+# Re-Run stillschweigend Uploads einschalten); Neuinstallationen starten auf
+# Sermony, das ist der Normalfall.
+if [[ "$CUR_SERMONY_UPLOAD" == "0" ]];                        then DEFAULT_UPLOAD="3"
+elif [[ -n "$CUR_SERMONY_UPLOAD" || -n "$CUR_UPLOAD_URL" ]];  then DEFAULT_UPLOAD="1"
+elif [[ -n "$CUR_W_HOST" ]];                                  then DEFAULT_UPLOAD="2"
+elif [[ -f "$ENV_FILE" ]];                                    then DEFAULT_UPLOAD="3"
+else                                                               DEFAULT_UPLOAD="1"
+fi
+
+c_green "4/5 · Wohin sollen fertige Aufnahmen?"
+echo "  1) Sermony — landen direkt in deiner Instanz und sind dort sofort"
+echo "     in der Mediathek sichtbar (empfohlen)"
+echo "  2) WebDAV — Nextcloud, ownCloud o.ä."
+echo "  3) keins — Aufnahmen bleiben nur auf dem Gerät"
 read -r -p "Auswahl [$DEFAULT_UPLOAD]: " UPLOAD_CHOICE
 UPLOAD_CHOICE="${UPLOAD_CHOICE:-$DEFAULT_UPLOAD}"
-UPLOAD_URL=""; W_HOST=""; W_USERNAME=""; W_PASSWORD=""; W_PATH="/"
+SERMONY_UPLOAD_ENABLED="0"; W_HOST=""; W_USERNAME=""; W_PASSWORD=""; W_PATH="/"
 case "$UPLOAD_CHOICE" in
+  1)
+    SERMONY_UPLOAD_ENABLED="1"
+    c_green "  → $SERMONY_HOST (Ziel und Token weist Sermony pro Aufnahme zu)"
+    ;;
   2)
     prompt_value W_HOST "WebDAV-Host (https://…)" "$CUR_W_HOST" required
+    W_HOST="$(normalize_url "$W_HOST")"
     prompt_value W_USERNAME "WebDAV-Benutzer" "$CUR_W_USERNAME" required
     prompt_value W_PASSWORD "WebDAV-Passwort" "$CUR_W_PASSWORD" required
     prompt_value W_PATH "WebDAV-Zielpfad" "${CUR_W_PATH:-/}"
-    ;;
-  3)
-    prompt_value UPLOAD_URL "Upload-URL (https://…)" "$CUR_UPLOAD_URL" required
     ;;
 esac
 echo
 
 # ── Metadaten (optional) ──────────────────────────────────────────────────────
-prompt_value META_ORGANIZATION "Gemeinde-/Organisationsname für ID3-Tags (leer = keiner)" "$CUR_META_ORGANIZATION"
-prompt_value META_WEBSITE "Webseite für ID3-Tags (leer = keine)" "$CUR_META_WEBSITE"
+c_green "5/5 · Angaben in der Audiodatei (optional)"
+echo "Diese Werte schreibt der Recorder als ID3-Tags in jede MP3 — sie erscheinen"
+echo "später im Player. Beides kann leer bleiben."
+prompt_value META_ORGANIZATION "Gemeinde-/Organisationsname" "$CUR_META_ORGANIZATION"
+prompt_value META_WEBSITE "Webseite" "$CUR_META_WEBSITE"
 echo
 
 # ── Secrets generieren (nur fehlende) ─────────────────────────────────────────
@@ -190,8 +251,10 @@ SCREEN_UPDATE_CHANNEL=${CUR_SCREEN_UPDATE_CHANNEL:-stable}
 SCREEN_UPDATE_URL=${CUR_SCREEN_UPDATE_URL:-}
 SCREEN_PICKUP_DIR=${CUR_SCREEN_PICKUP_DIR:-/opt/sermony-recorder/screen-pickup}
 
-# Upload-Ziel
-UPLOAD_URL=$UPLOAD_URL
+# Upload-Ziel. Bei "Sermony" steht hier NICHTS: seit ADR-029 weist die Instanz das
+# Upload-Ziel pro Aufnahme zu, SERMONY_HOST oben genügt. Nicht von Hand pflegen:
+# setup.sh erneut ausführen.
+SERMONY_UPLOAD=$SERMONY_UPLOAD_ENABLED
 W_HOST=$W_HOST
 W_USERNAME=$W_USERNAME
 W_PASSWORD=$W_PASSWORD

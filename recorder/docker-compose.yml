@@ -194,8 +194,10 @@ services:
         condition: service_healthy
     environment:
       <<: *common-env
-      # Upload-Ziel: ENTWEDER UPLOAD_URL (HTTP) ODER W_* (WebDAV); beides leer ⇒ nur lokal
-      UPLOAD_URL: "${UPLOAD_URL:-}"
+      # Upload-Ziel (ADR-029): SERMONY_UPLOAD=1 lädt zu Sermony hoch — Ziel und Token
+      # weist die Instanz pro Aufnahme zu, es gibt KEINE UPLOAD_URL mehr. Alternativ
+      # W_* (WebDAV). Beides aus ⇒ Aufnahmen bleiben nur auf dem Gerät.
+      SERMONY_UPLOAD: "${SERMONY_UPLOAD:-1}"
       W_HOST: "${W_HOST:-}"
       W_USERNAME: "${W_USERNAME:-}"
       W_PASSWORD: "${W_PASSWORD:-}"
