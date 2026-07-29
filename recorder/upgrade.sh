@@ -157,6 +157,29 @@ fi
 cd "$DEPLOY_DIR"
 c_green "Ziehe aktuelle Images..."
 docker compose pull
+
+# ── Ownership des Audio-Volumes (Bestandsinstallationen) ─────────────────────
+# Docker uebernimmt die Ownership aus dem Image NUR beim Initialisieren eines
+# LEEREN Volumes. Wessen audio-Volume noch unter dem alten, als root laufenden
+# Image entstanden ist, hat es root-owned — der non-root-Container stirbt dann
+# beim Import von log_manager (mkdir /mnt/audio/logs → EACCES), bevor irgendein
+# Healthcheck greift. Einmalig geradeziehen; bei korrektem Owner ein No-op.
+# Bewusst nur bei eindeutig gelesener Fremd-uid: lieber nichts tun als blind
+# chownen, wenn die Abfrage schiefging.
+AUDIO_OWNER="$(docker compose run --rm --no-deps --user 0 --entrypoint stat \
+  media_capture_streaming -c '%u' /mnt/audio 2>/dev/null | tr -d '\r' | tail -n1 || true)"
+if [[ "$AUDIO_OWNER" =~ ^[0-9]+$ ]] && [[ "$AUDIO_OWNER" != "1000" ]]; then
+  c_yellow "Audio-Volume gehört uid $AUDIO_OWNER statt 1000 — ziehe Ownership gerade..."
+  if docker compose run --rm --no-deps --user 0 --entrypoint chown \
+       media_capture_streaming -R 1000:1000 /mnt/audio >/dev/null 2>&1; then
+    c_green "Ownership des Audio-Volumes korrigiert."
+  else
+    c_red "Ownership konnte nicht korrigiert werden — der Recorder wird so nicht starten."
+    c_yellow "  Manuell in $DEPLOY_DIR:"
+    c_yellow "  docker compose run --rm --no-deps --user 0 --entrypoint chown media_capture_streaming -R 1000:1000 /mnt/audio"
+  fi
+fi
+
 c_green "Starte Stack neu (nur geänderte Container werden ersetzt)..."
 docker compose up -d
 docker compose ps

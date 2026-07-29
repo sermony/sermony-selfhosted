@@ -85,6 +85,21 @@ normalize_url() {
   printf '%s' "${u%/}"
 }
 
+# Tippfehler in der Adresse sollen SOFORT auffallen, nicht erst wenn der Recorder
+# stumm bleibt und niemand weiss warum. /api/health ist der Liveness-Endpunkt der
+# Webapp: immer 200, kein Login noetig. Bewusst nur ein Hinweis und kein Abbruch —
+# ein Geraet darf auch ohne Netz vorkonfiguriert werden.
+check_sermony_reachable() {
+  local base="$1" code
+  command -v curl >/dev/null 2>&1 || return 0
+  code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 "${base}/api/health" 2>/dev/null || true)"
+  case "$code" in
+    200)      c_green  "  Sermony ist unter dieser Adresse erreichbar." ;;
+    000|"")   c_yellow "  Hinweis: keine Antwort von $base — Schreibweise prüfen, oder ist das Gerät noch ohne Netz?" ;;
+    *)        c_yellow "  Hinweis: $base/api/health antwortet mit HTTP $code — ist das wirklich deine Sermony-Adresse?" ;;
+  esac
+}
+
 command -v openssl >/dev/null 2>&1 || { c_red "openssl wird benötigt (API-Key-Generierung)."; exit 1; }
 if ! command -v docker >/dev/null 2>&1; then
   c_red "Docker wird benötigt, ist aber nicht installiert."
@@ -133,8 +148,12 @@ echo "Einstellungen → Recorder → Token. Der Token wird dort nur EINMAL angez
 echo
 echo "Adresse deiner Instanz: Wenn du Sermony selbst betreibst, trage deine eigene"
 echo "Domain ein. Nutzt du das gehostete Sermony, drücke einfach Enter."
+echo "Die Schreibweise ist egal — meine-gemeinde.de, https://meine-gemeinde.de oder"
+echo "mit Schrägstrich am Ende ergeben alle dasselbe."
 prompt_value SERMONY_HOST "Sermony-Adresse" "${CUR_SERMONY_HOST:-$OFFICIAL_SERMONY_URL}" required
 SERMONY_HOST="$(normalize_url "$SERMONY_HOST")"
+c_green "  → $SERMONY_HOST"
+check_sermony_reachable "$SERMONY_HOST"
 prompt_value RECORDER_ID "Recorder-ID (aus der Webapp)" "$CUR_RECORDER_ID" required
 prompt_value RECORDER_TOKEN "Recorder-Token (aus der Webapp)" "$CUR_RECORDER_TOKEN" required
 echo
@@ -293,7 +312,18 @@ read -r -p "Stack jetzt starten? (j/n) [j]: " START_ANSWER
 START_ANSWER="${START_ANSWER:-j}"
 if [[ "$START_ANSWER" =~ ^[jJyY] ]]; then
   cd "$DEPLOY_DIR"
-  docker compose pull
+  # Der Roh-Fehler von Docker ("Head https://…/manifests/stable: unauthorized")
+  # sagt einem Nicht-Techniker nichts. Die .env ist zu diesem Zeitpunkt bereits
+  # geschrieben — ein spaeterer Start holt den Pull nach, es geht nichts verloren.
+  if ! docker compose pull; then
+    echo
+    c_red "Das Container-Image konnte nicht geladen werden."
+    c_yellow "Eingestellt ist: $(read_env_value RECORDER_IMAGE "$ENV_FILE")"
+    c_yellow "Meist heisst das: dieses Image ist (noch) nicht oeffentlich freigegeben"
+    c_yellow "oder der Name stimmt nicht. Deine Angaben sind in $ENV_FILE gespeichert."
+    c_yellow "Nach dem Klaeren genuegt:  cd $DEPLOY_DIR && docker compose up -d"
+    exit 1
+  fi
   docker compose up -d
   echo
   c_green "Gestartet. Status:  cd $DEPLOY_DIR && docker compose ps"

@@ -25,11 +25,15 @@ Wo bereits etwas eingetragen ist, steht es als Vorschlag in eckigen Klammern; En
 
 1. **Verbindung zu Sermony** — Adresse deiner Instanz (selbst gehostet: eigene Domain,
    sonst Enter für das gehostete Sermony) sowie Recorder-ID und -Token aus der Webapp.
+   Bei der Adresse ist die Schreibweise egal: `meine-gemeinde.de`,
+   `https://meine-gemeinde.de` und ein Schrägstrich am Ende führen zum selben
+   Ergebnis. Das Setup zeigt dir die übernommene Adresse an und prüft direkt, ob
+   Sermony dort antwortet.
 2. **Aufnahme** — Zeitzone (steuert geplante Aufnahmen) und Mono/Stereo.
 3. **Status-Display** — nur falls das USB-Display angeschlossen ist.
 4. **Upload-Ziel** — normalerweise „Sermony": die Aufnahmen landen direkt in deiner
-   Instanz, die Adresse dafür ergibt sich automatisch aus Schritt 1. Alternativ ein
-   eigener HTTP-Endpoint, WebDAV (Nextcloud & Co.) oder gar keiner.
+   Instanz, das Ziel ergibt sich automatisch aus Schritt 1. Alternativ WebDAV
+   (Nextcloud & Co.) oder gar keins.
 5. **Angaben in der Audiodatei** — Gemeindename und Webseite für die MP3-Tags, optional.
 
 ## Update
