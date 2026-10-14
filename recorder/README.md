@@ -9,6 +9,12 @@ gebaut werden.
 - Docker mit Docker Compose v2 (`curl -fsSL https://get.docker.com | sh`)
 - Zugangsdaten aus der Sermony-Webapp (Einstellungen → Recorder):
   Sermony-URL, Recorder-ID, Recorder-Token
+- **Richtige Uhrzeit (NTP)**: Die Anmeldung bei Sermony ist zeitgebunden — weicht die Uhr des
+  Geräts mehr als etwa 20 Sekunden ab, lehnt Sermony den Recorder ab (Meldung in der Webapp:
+  „Uhr des Recorders weicht ab"). Prüfen mit `timedatectl` (`System clock synchronized: yes`).
+  Raspberry Pi OS synchronisiert per `systemd-timesyncd`, braucht dafür aber Zugang zu einem
+  NTP-Server (UDP 123). Ein Raspberry Pi ohne RTC-Batterie startet nach einem Stromausfall mit
+  falscher Uhrzeit, bis NTP sie stellt — der Wiederanlauf von Aufnahme/Stream wartet darauf.
 
 ## Installation
 
