@@ -55,6 +55,7 @@ c_green()  { printf '\033[32m%s\033[0m\n' "$*"; }
 c_yellow() { printf '\033[33m%s\033[0m\n' "$*"; }
 c_red()    { printf '\033[31m%s\033[0m\n' "$*" >&2; }
 
+ORIG_ARGS=("$@")
 PRUNE=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -108,13 +109,20 @@ update_from_release() {
 }
 
 # ── Bundle aktualisieren (Compose-Datei, Scripts) ─────────────────────────────
-if [[ -d "$REPO_ROOT/.git" ]] && command -v git >/dev/null 2>&1; then
-  c_green "Git-Clone erkannt — aktualisiere via git pull..."
-  git -C "$REPO_ROOT" pull --ff-only || {
-    c_red "git pull fehlgeschlagen (lokale Änderungen?). Bitte manuell auflösen."; exit 1; }
-else
-  c_yellow "Kein Git-Repo — aktualisiere via Gitea-Release-Tarball."
-  update_from_release
+# Danach mit dem NEUEN upgrade.sh weitermachen: Git und update_from_release ersetzen die Datei
+# per rename, dieser Prozess liefe sonst mit dem alten Inhalt zu Ende — neue Schritte griffen
+# erst beim nächsten Update.
+if [[ -z "${SERMONY_UPGRADE_BUNDLE_DONE:-}" ]]; then
+  if [[ -d "$REPO_ROOT/.git" ]] && command -v git >/dev/null 2>&1; then
+    c_green "Git-Clone erkannt — aktualisiere via git pull..."
+    git -C "$REPO_ROOT" pull --ff-only || {
+      c_red "git pull fehlgeschlagen (lokale Änderungen?). Bitte manuell auflösen."; exit 1; }
+  else
+    c_yellow "Kein Git-Repo — aktualisiere via Gitea-Release-Tarball."
+    update_from_release
+  fi
+  export SERMONY_UPGRADE_BUNDLE_DONE=1
+  exec bash "$SCRIPT_DIR/upgrade.sh" "${ORIG_ARGS[@]}"
 fi
 
 # ── .env-Reconcile: neue Keys aus .env.example nachtragen ─────────────────────
@@ -180,8 +188,15 @@ if [[ "$AUDIO_OWNER" =~ ^[0-9]+$ ]] && [[ "$AUDIO_OWNER" != "1000" ]]; then
   fi
 fi
 
+# ── DNS-Zwischenspeicher: Netzwechsel ohne Neustart der Container ────────────
+# Details in dns-cache.sh. Gerät vor dem Start einrichten, danach die Container, die noch mit
+# dem alten DNS-Eintrag laufen, einmalig neu starten.
+DNS_CACHE="$SCRIPT_DIR/dns-cache.sh"
+[[ -f "$DNS_CACHE" ]] && bash "$DNS_CACHE" host "$DEPLOY_DIR"
+
 c_green "Starte Stack neu (nur geänderte Container werden ersetzt)..."
 docker compose up -d
+[[ -f "$DNS_CACHE" ]] && bash "$DNS_CACHE" containers "$DEPLOY_DIR"
 docker compose ps
 
 if [[ $PRUNE -eq 1 ]]; then

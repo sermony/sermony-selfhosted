@@ -307,6 +307,12 @@ if [[ "$COMPOSE_PROFILES" == *esp32* ]]; then
   echo
 fi
 
+# ── DNS-Zwischenspeicher: Netzwechsel ohne Neustart der Container ────────────
+# Details in dns-cache.sh. Vor dem Start, damit die Container gleich den richtigen Eintrag haben.
+DNS_CACHE="$SCRIPT_DIR/dns-cache.sh"
+[[ -f "$DNS_CACHE" ]] && bash "$DNS_CACHE" host "$DEPLOY_DIR"
+echo
+
 # ── Start anbieten ────────────────────────────────────────────────────────────
 read -r -p "Stack jetzt starten? (j/n) [j]: " START_ANSWER
 START_ANSWER="${START_ANSWER:-j}"
@@ -325,6 +331,7 @@ if [[ "$START_ANSWER" =~ ^[jJyY] ]]; then
     exit 1
   fi
   docker compose up -d
+  [[ -f "$DNS_CACHE" ]] && bash "$DNS_CACHE" containers "$DEPLOY_DIR"
   echo
   c_green "Gestartet. Status:  cd $DEPLOY_DIR && docker compose ps"
   c_green "Bedien-UI:          http://<host>:5000"

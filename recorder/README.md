@@ -49,6 +49,14 @@ cd /opt/sermony-recorder
 sudo ./upgrade.sh            # holt das neueste Paket + Image und startet neu
 ```
 
+## Netzwechsel (anderes WLAN, Kabel statt WLAN)
+
+`setup.sh` und `upgrade.sh` stellen die Namensauflösung des Geräts auf einen kleinen
+Zwischenspeicher um (dnsmasq über NetworkManager, Datei
+`/etc/NetworkManager/conf.d/90-sermony-dns.conf`). Damit findet der Recorder nach einem
+Netzwechsel sofort wieder zu Sermony — ohne Neustart. Ohne NetworkManager wird der Schritt
+übersprungen; dann nach einem Netzwechsel einmal `docker compose restart` ausführen.
+
 ## Status & Logs
 
 ```bash
